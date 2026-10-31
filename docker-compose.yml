@@ -1,0 +1,35 @@
+# 3 nós do sistema de ingressos em uma rede Docker.
+#   Subir:            docker compose up --build
+#   Cliente:          docker compose run --rm cliente
+#   Derrubar o líder: docker compose stop no3
+#   Religar:          docker compose start no3
+
+x-no: &no
+  build: .
+  environment: &env
+    PEERS: "1=no1:50051,2=no2:50051,3=no3:50051"
+    PORTA: "50051"
+    ATRASO_SECAO_CRITICA: "1"   # 1 s na seção crítica, para a espera aparecer na demo
+
+services:
+  no1:
+    <<: *no
+    environment: { <<: *env, NO_ID: "1" }
+    ports: ["50051:50051"]
+
+  no2:
+    <<: *no
+    environment: { <<: *env, NO_ID: "2" }
+    ports: ["50052:50051"]
+
+  no3:
+    <<: *no
+    environment: { <<: *env, NO_ID: "3" }
+    ports: ["50053:50051"]
+
+  cliente:
+    build: .
+    profiles: ["cliente"]           # não sobe com "up"; use "docker compose run"
+    command: ["python", "src/cliente.py", "no1:50051", "no2:50051", "no3:50051"]
+    stdin_open: true
+    tty: true

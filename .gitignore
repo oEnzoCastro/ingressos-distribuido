@@ -1,0 +1,26 @@
+# Cache do Python
+__pycache__/
+*.py[cod]
+
+# Código gerado pelo gerar_proto.py (cada pessoa gera o seu)
+src/ingressos_pb2.py
+src/ingressos_pb2_grpc.py
+src/ingressos_pb2.pyi
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+
+# Testes
+.pytest_cache/
+
+# Editores e sistema
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs salvos dos testes (guardem em outra pasta ou no relatório)
+*.log

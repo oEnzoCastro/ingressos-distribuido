@@ -1,0 +1,145 @@
+// =====================================================================
+// CONTRATO gRPC DO SISTEMA DE INGRESSOS
+// =====================================================================
+// Este arquivo é o "contrato" entre os nós.
+// Ele diz QUAIS funções um nó pode chamar em outro nó (rpc)
+// e QUAIS dados vão em cada mensagem (message).
+//
+// A ferramenta grpc_tools.protoc lê este arquivo e gera dois arquivos Python:
+//   ingressos_pb2.py       -> as classes das mensagens
+//   ingressos_pb2_grpc.py  -> o código de rede (cliente "stub" e servidor)
+// Vocês não editam os arquivos gerados. Vocês editam só este arquivo.
+//
+// Regra do relógio de Lamport: toda mensagem ENTRE NÓS tem o campo "relogio".
+// =====================================================================
+
+syntax = "proto3";
+
+package ingressos;
+
+service NoIngressos {
+  // ---------- Chamadas do cliente (comprador) para um nó ----------
+  rpc Comprar (PedidoCompra) returns (RespostaCompra);
+  rpc ConsultarMapa (Vazio) returns (Estado);
+  rpc ConsultarStatus (Vazio) returns (Status);
+  rpc ConsultarLog (Vazio) returns (Log);
+  // Abrir ou fechar as vendas. Quem decide é o LÍDER.
+  // Se o nó não for o líder, ele repassa o pedido ao líder.
+  rpc AlterarVendas (PedidoVendas) returns (RespostaSimples);
+
+  // ---------- Exclusão mútua (Ricart-Agrawala) ----------
+  // "Posso usar o assento X?" A resposta só volta quando o nó permite.
+  rpc PedirAcesso (PedidoAcesso) returns (Permissao);
+
+  // ---------- Replicação dos dados ----------
+  rpc ReplicarVenda (Venda) returns (Confirmacao);
+  rpc DefinirVendas (EstadoVendas) returns (Confirmacao);
+  rpc ObterEstado (Vazio) returns (Estado);
+
+  // ---------- Eleição de líder (Bully) ----------
+  rpc Eleicao (MsgEleicao) returns (Confirmacao);
+  rpc Coordenador (MsgCoordenador) returns (Confirmacao);
+  rpc Heartbeat (MsgHeartbeat) returns (RespostaHeartbeat);
+}
+
+message Vazio {}
+
+// ---------- Cliente ----------
+message PedidoCompra {
+  string assento = 1;     // exemplo: "A5"
+  string comprador = 2;   // exemplo: "Maria"
+}
+
+message RespostaCompra {
+  bool sucesso = 1;
+  string mensagem = 2;
+  int64 relogio = 3;      // relógio de Lamport da venda
+  int32 no = 4;           // nó que atendeu o pedido
+}
+
+message PedidoVendas {
+  bool abertas = 1;
+  int64 relogio = 2;   // 0 quando vem do cliente; preenchido quando um nó repassa ao líder
+}
+
+message RespostaSimples {
+  bool sucesso = 1;
+  string mensagem = 2;
+}
+
+message Status {
+  int32 id = 1;
+  int32 lider = 2;            // 0 = líder desconhecido
+  repeated int32 ativos = 3;  // nós ativos, segundo o líder
+  int64 relogio = 4;
+  bool vendas_abertas = 5;
+  int32 vendidos = 6;
+  int32 total_assentos = 7;
+}
+
+message Evento {
+  int64 relogio = 1;
+  int32 no = 2;
+  string texto = 3;
+}
+
+message Log {
+  repeated Evento eventos = 1;
+}
+
+// ---------- Exclusão mútua ----------
+message PedidoAcesso {
+  string recurso = 1;   // o assento
+  int32 origem = 2;     // id do nó que pede
+  int64 relogio = 3;    // timestamp de Lamport do pedido
+}
+
+message Permissao {
+  int64 relogio = 1;
+}
+
+// ---------- Replicação ----------
+message Venda {
+  string assento = 1;
+  string comprador = 2;
+  int32 no_origem = 3;
+  int64 relogio = 4;        // relógio da MENSAGEM (Lamport)
+  int64 relogio_venda = 5;  // relógio do momento da VENDA (igual em todas as réplicas)
+}
+
+message EstadoVendas {
+  bool abertas = 1;
+  int64 relogio = 2;
+}
+
+message Estado {
+  repeated Venda vendidos = 1;
+  bool vendas_abertas = 2;
+  int64 relogio = 3;
+}
+
+message Confirmacao {
+  int64 relogio = 1;
+}
+
+// ---------- Eleição ----------
+message MsgEleicao {
+  int32 origem = 1;
+  int64 relogio = 2;
+}
+
+message MsgCoordenador {
+  int32 lider = 1;
+  int64 relogio = 2;
+}
+
+message MsgHeartbeat {
+  int32 origem = 1;
+  int64 relogio = 2;
+}
+
+message RespostaHeartbeat {
+  int32 lider = 1;
+  repeated int32 ativos = 2;
+  int64 relogio = 3;
+}
