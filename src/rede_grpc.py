@@ -11,8 +11,12 @@ Como o gRPC funciona, em 3 passos:
      e devolve a resposta, como uma função local.
 
 Erros de rede viram as exceções da interface Rede:
-  UNAVAILABLE        -> NoIndisponivel (nó desligado)
-  DEADLINE_EXCEEDED  -> TempoEsgotado  (nó não respondeu a tempo)
+  UNAVAILABLE        -> NoIndisponivel (não há conexão com o nó)
+  qualquer outro     -> TempoEsgotado  (o nó não respondeu a tempo ou deu erro)
+
+Só UNAVAILABLE conta como "nó desligado", porque a exclusão mútua trata um
+nó desligado como permissão concedida. Um erro interno do outro nó NÃO
+pode virar permissão: ele cancela a operação.
 """
 
 import grpc
@@ -48,16 +52,17 @@ class RedeGrpc(Rede):
         try:
             return funcao(mensagem, timeout=timeout)
         except grpc.RpcError as erro:
-            if erro.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
-                raise TempoEsgotado(destino) from erro
-            raise NoIndisponivel(destino) from erro
+            if erro.code() == grpc.StatusCode.UNAVAILABLE:
+                raise NoIndisponivel(destino) from erro
+            raise TempoEsgotado(destino) from erro
 
     # ----- Exclusão mútua -----
     def pedir_acesso(self, destino, recurso, origem, relogio):
         r = self._chamar(destino, "PedirAcesso",
                          pb.PedidoAcesso(recurso=recurso, origem=origem, relogio=relogio),
                          timeout=TIMEOUT_ACESSO)
-        return r.relogio
+        venda = (r.vendido_para, r.vendido_no, r.vendido_relogio) if r.vendido_para else None
+        return r.relogio, venda
 
     # ----- Replicação -----
     def replicar_venda(self, destino, assento, comprador, no_origem, relogio_venda, relogio):

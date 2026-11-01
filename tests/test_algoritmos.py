@@ -186,6 +186,34 @@ def test_dois_lideres_se_corrigem():
     assert esperar(lambda: set(lideres(rede).values()) == {3}, limite=8), lideres(rede)
 
 
+def test_replica_perdida_nao_causa_venda_dupla():
+    """Caso achado na revisão: o nó 1 vende A1 sem alcançar o nó 3 por um
+    instante. Depois, o nó 3 tenta vender A1: ele deve descobrir a venda
+    pela resposta da permissão e recusar."""
+    rede = criar_cluster(3)
+    assert esperar(lambda: set(lideres(rede).values()) == {3})
+    rede.bloqueados.add((1, 3))
+    assert rede.nos[1].comprar("A1", "Maria")[0]
+    rede.bloqueados.clear()
+
+    ok, msg, _ = rede.nos[3].comprar("A1", "João")
+    assert not ok, "venda dupla: " + msg
+    donos = {i: n.vendidos["A1"][0] for i, n in rede.nos.items()}
+    assert set(donos.values()) == {"Maria"}, donos
+
+
+def test_conflito_resolvido_pela_ordem_de_lamport():
+    """Se duas vendas do mesmo assento se encontram, todas as cópias ficam
+    com a mesma: a de menor (relogio_venda, no_origem), em qualquer ordem."""
+    rede = criar_cluster(3, iniciar=False)
+    a, b = ("Maria", 1, 40), ("João", 3, 42)
+    rede.nos[1].ao_receber_venda("C3", *a, relogio=50)
+    rede.nos[1].ao_receber_venda("C3", *b, relogio=51)
+    rede.nos[2].ao_receber_venda("C3", *b, relogio=50)
+    rede.nos[2].ao_receber_venda("C3", *a, relogio=51)
+    assert rede.nos[1].vendidos["C3"] == rede.nos[2].vendidos["C3"] == a
+
+
 if __name__ == "__main__":
     import inspect
     falhas = 0

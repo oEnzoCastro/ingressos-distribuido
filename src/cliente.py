@@ -90,8 +90,7 @@ class Cliente:
 
         def tentar(n):
             barreira.wait()
-            resultados[n] = self.chamar(n, "Comprar",
-                                        pb.PedidoCompra(assento=assento, comprador=f"Comprador-no{n}"))
+            resultados[n] = self.chamar(n, "Comprar", pb.PedidoCompra(assento=assento, comprador=f"Comprador-no{n}"))
 
         threads = [threading.Thread(target=tentar, args=(n,)) for n in range(1, len(self.stubs) + 1)]
         [t.start() for t in threads]

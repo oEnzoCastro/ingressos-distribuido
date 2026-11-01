@@ -1,4 +1,5 @@
-"""Gera ingressos_pb2.py e ingressos_pb2_grpc.py a partir do arquivo .proto.
+"""
+Gera ingressos_pb2.py e ingressos_pb2_grpc.py a partir do arquivo .proto.
 Execute depois de mudar proto/ingressos.proto:   python gerar_proto.py
 """
 import os

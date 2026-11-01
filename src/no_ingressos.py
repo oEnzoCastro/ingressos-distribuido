@@ -17,7 +17,15 @@ Fluxo de uma compra no nó N:
   5. Sai da seção crítica.
 
 Como a réplica acontece ANTES de sair da seção crítica, o próximo nó que
-entrar já vê o assento como vendido. Assim, nunca há venda dupla.
+entrar já vê o assento como vendido.
+
+E se a réplica não chegou (falha rápida de rede)? Cada nó que dá a
+permissão no passo 2 conta junto se já sabe que o assento foi vendido.
+Assim, o nó que perdeu a réplica corrige a sua cópia antes do passo 3.
+
+Se duas vendas do mesmo assento se encontram (só numa divisão longa da
+rede), vale a venda que veio primeiro na ordem de Lamport: menor
+(relogio_venda, no_origem). Todas as cópias escolhem a mesma.
 """
 
 import threading
@@ -47,7 +55,8 @@ class NoIngressos:
         self.verbose = verbose
 
         self.relogio = RelogioLamport()
-        self.mutex = ExclusaoMutua(meu_id, self.ids_outros, rede, self.relogio, self.log)
+        self.mutex = ExclusaoMutua(meu_id, self.ids_outros, rede, self.relogio, self.log,
+                                   consultar_recurso=self._consultar_assento)
         self.eleicao = EleicaoBully(meu_id, self.todos_ids, rede, self.relogio, self.log,
                                     ao_mudar_lider=self._ao_mudar_lider,
                                     espera_coordenador=espera_coordenador)
@@ -70,7 +79,9 @@ class NoIngressos:
     # Log com relógio de Lamport
     # ------------------------------------------------------------------
     def log(self, texto):
-        rel = self.relogio.valor
+        # Cada evento registrado é um evento de Lamport: soma 1 no relógio.
+        # Assim, dois eventos do mesmo nó nunca têm o mesmo valor.
+        rel = self.relogio.tick()
         with self._lock_eventos:
             self._eventos.append((rel, self.meu_id, texto))
         if self.verbose:
@@ -102,14 +113,25 @@ class NoIngressos:
                 continue
             self.relogio.atualizar(rel)
             with self._lock_dados:
-                self.vendidos.update(vendidos)
+                for assento, venda in vendidos.items():
+                    self._mesclar_venda(assento, venda, "réplica")
                 self.vendas_abertas = abertas
             self.log(f"estado copiado do nó {destino}: {len(vendidos)} assentos vendidos")
             return
         self.log("nenhum outro nó ativo; começa com o mapa vazio")
 
     def _monitorar(self):
-        """Laço de fundo: heartbeat para o líder e detecção de falha."""
+        """Laço de fundo. Um erro inesperado não pode matar este laço:
+        sem ele, o nó para de mandar heartbeat e de fazer eleições."""
+        while self._rodando:
+            try:
+                self._ciclo_monitor()
+            except Exception as erro:  # noqa: BLE001
+                self.log(f"erro no monitor: {erro!r}; continua")
+                time.sleep(self.intervalo_heartbeat)
+
+    def _ciclo_monitor(self):
+        """Heartbeat para o líder e detecção de falha."""
         falhas_seguidas = 0
         while self._rodando:
             lider = self.eleicao.lider
@@ -163,7 +185,10 @@ class NoIngressos:
 
     def _atualizar_ativos(self):
         agora = time.time()
-        vivos = [i for i, t in self._ultimo_contato.items() if agora - t < self.limite_inativo]
+        # list(...) faz uma cópia: outro thread pode incluir um nó enquanto
+        # este percorre o dicionário, o que geraria um erro.
+        contatos = list(self._ultimo_contato.items())
+        vivos = [i for i, t in contatos if agora - t < self.limite_inativo]
         self.ativos = sorted(vivos + [self.meu_id])
 
     # ------------------------------------------------------------------
@@ -178,13 +203,17 @@ class NoIngressos:
             return False, "As vendas estão fechadas", self.relogio.valor
 
         self.log(f"pedido de compra: {assento} para {comprador}")
-        if not self.mutex.entrar(assento):
+        ok, infos = self.mutex.entrar(assento)
+        if not ok:
             return False, "Não foi possível reservar o assento (tente de novo)", self.relogio.valor
         try:
             if self.atraso_secao_critica:
                 time.sleep(self.atraso_secao_critica)  # só para a demonstração
 
             with self._lock_dados:
+                # O que os outros nós contaram junto com a permissão.
+                for venda in infos:
+                    self._mesclar_venda(assento, venda, "permissão de outro nó")
                 if assento in self.vendidos:
                     dono = self.vendidos[assento][0]
                     self.log(f"compra RECUSADA: {assento} já é de {dono}")
@@ -251,10 +280,38 @@ class NoIngressos:
     # ------------------------------------------------------------------
     def ao_receber_venda(self, assento, comprador, no_origem, relogio_venda, relogio):
         self.relogio.atualizar(relogio)
-        with self._lock_dados:
-            self.vendidos[assento] = (comprador, no_origem, relogio_venda)
         self.log(f"réplica recebida: {assento} vendido pelo nó {no_origem} para {comprador}")
+        with self._lock_dados:
+            self._mesclar_venda(assento, (comprador, no_origem, relogio_venda), "réplica")
         return self.relogio.tick()
+
+    # ------------------------------------------------------------------
+    # Consistência das cópias
+    # ------------------------------------------------------------------
+    def _consultar_assento(self, assento):
+        """Enviado junto com a permissão (Ricart-Agrawala)."""
+        with self._lock_dados:
+            return self.vendidos.get(assento)
+
+    def _mesclar_venda(self, assento, venda, origem):
+        """Junta uma venda vinda de outro nó com a cópia local.
+        Chamar com self._lock_dados já adquirido.
+        Conflito: vence a venda que veio primeiro na ordem de Lamport."""
+        atual = self.vendidos.get(assento)
+        if atual == venda:
+            return
+        if atual is None:
+            self.vendidos[assento] = venda
+            if origem != "réplica":
+                self.log(f"cópia corrigida: {assento} já era de {venda[0]} "
+                         f"(nó {venda[1]}); a réplica tinha sido perdida")
+            return
+        chave = lambda v: (v[2], v[1])   # (relogio_venda, no_origem)
+        vencedora = min(atual, venda, key=chave)
+        perdedora = venda if vencedora is atual else atual
+        self.vendidos[assento] = vencedora
+        self.log(f"CONFLITO em {assento}: fica {vencedora[0]} (L={vencedora[2]}), "
+                 f"descarta {perdedora[0]} (L={perdedora[2]})")
 
     def ao_receber_definir_vendas(self, abertas, relogio):
         self.relogio.atualizar(relogio)

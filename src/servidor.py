@@ -54,8 +54,12 @@ class ServicoNo(pb_grpc.NoIngressosServicer):
     # ---------- Exclusão mútua ----------
     def PedirAcesso(self, req, ctx):
         # Esta chamada pode "ficar parada" aqui até o nó liberar o assento.
-        rel = self.no.mutex.ao_receber_pedido(req.recurso, req.origem, req.relogio)
-        return pb.Permissao(relogio=rel)
+        rel, venda = self.no.mutex.ao_receber_pedido(req.recurso, req.origem, req.relogio)
+        if venda is None:
+            return pb.Permissao(relogio=rel)
+        comprador, no_origem, relogio_venda = venda
+        return pb.Permissao(relogio=rel, vendido_para=comprador,
+                            vendido_no=no_origem, vendido_relogio=relogio_venda)
 
     # ---------- Replicação ----------
     def ReplicarVenda(self, req, ctx):

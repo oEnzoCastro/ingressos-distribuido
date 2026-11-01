@@ -102,14 +102,20 @@ No cliente:
 python tests/test_algoritmos.py
 ```
 
-Os testes conferem: Lamport, a corrida pelo mesmo assento, muitas compras
+Os 12 testes conferem: Lamport, a corrida pelo mesmo assento, muitas compras
 concorrentes sem venda dupla, réplicas iguais, eleição inicial, a falha e a
-volta do líder, a abertura de vendas pelo líder e a lista de nós ativos.
+volta do líder, a abertura de vendas pelo líder, a lista de nós ativos, a
+correção de dois líderes ao mesmo tempo, a réplica perdida que não pode
+causar venda dupla e a regra de conflito pela ordem de Lamport.
 
 ## Limitações conhecidas (planejadas para a Entrega 2)
 
 - Os dados ficam só na memória.
-- Um nó que caiu no meio de uma venda pode ficar sem aquela réplica até reiniciar.
-- O sistema considera "desligado" um nó que não responde. Se a rede se divide
-  em dois grupos (partição), cada lado elege um líder e pode vender o mesmo
-  assento. Para tratar isso, a Entrega 2 pode usar quórum (maioria) ou 2PC.
+- Uma réplica perdida é corrigida na próxima vez que alguém pede aquele
+  assento (a resposta da permissão traz a venda). Até lá, o mapa daquele nó
+  fica desatualizado.
+- O sistema considera "desligado" um nó sem conexão. Se um nó fica isolado
+  de TODOS os outros, ele e o resto podem vender o mesmo assento. Quando as
+  vendas se encontram, vale a primeira na ordem de Lamport, mas uma delas já
+  foi confirmada ao comprador. Para impedir isso, a Entrega 2 pode exigir
+  quórum (maioria dos nós) ou usar 2PC.

@@ -96,6 +96,11 @@ message PedidoAcesso {
 
 message Permissao {
   int64 relogio = 1;
+  // Se quem permite já sabe que o assento foi vendido, conta junto.
+  // Assim, um nó que perdeu uma réplica descobre a venda antes de vender de novo.
+  string vendido_para = 2;     // vazio = não conhece venda deste assento
+  int32 vendido_no = 3;
+  int64 vendido_relogio = 4;
 }
 
 // ---------- Replicação ----------

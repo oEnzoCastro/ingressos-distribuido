@@ -28,6 +28,11 @@ Falhas (simples, para a Entrega 1):
   - Nó desligado (NoIndisponivel): não pode vender nada, então é ignorado.
   - Nó ativo que não responde a tempo (TempoEsgotado): a compra é cancelada,
     para não arriscar uma venda dupla.
+
+Informação junto com a permissão:
+  Quem permite o acesso também devolve o que sabe sobre o recurso
+  (função consultar_recurso). Se um nó perdeu a réplica de uma venda, ele
+  descobre a venda pela resposta, ANTES de entrar na seção crítica.
 """
 
 import threading
@@ -41,12 +46,13 @@ DENTRO = "DENTRO"
 
 
 class ExclusaoMutua:
-    def __init__(self, meu_id, ids_outros, rede, relogio, log):
+    def __init__(self, meu_id, ids_outros, rede, relogio, log, consultar_recurso=None):
         self.meu_id = meu_id
         self.ids_outros = list(ids_outros)
         self.rede = rede
         self.relogio = relogio
         self.log = log
+        self.consultar_recurso = consultar_recurso or (lambda recurso: None)
 
         self._cond = threading.Condition()
         # recurso -> (estado, timestamp do meu pedido)
@@ -64,9 +70,12 @@ class ExclusaoMutua:
     # ------------------------------------------------------------------
     # Lado de quem PEDE
     # ------------------------------------------------------------------
-    def entrar(self, recurso: str) -> bool:
-        """Bloqueia até ter acesso exclusivo ao recurso.
-        Devolve False se algum nó ativo não respondeu a tempo."""
+    def entrar(self, recurso: str):
+        """
+        Bloqueia até ter acesso exclusivo ao recurso.
+        Devolve (ok, infos): ok = False se algum nó ativo não respondeu a tempo;
+        infos = o que os outros nós sabem sobre o recurso (Nones são omitidos).
+        """
         self._lock_local(recurso).acquire()
 
         with self._cond:
@@ -77,28 +86,28 @@ class ExclusaoMutua:
         # Envia os pedidos em paralelo e espera todas as respostas.
         futuros = [self._pool.submit(self._pedir, destino, recurso, ts)
                    for destino in self.ids_outros]
-        todos_ok = all(f.result() for f in futuros)
+        resultados = [f.result() for f in futuros]
 
-        if not todos_ok:
+        if not all(ok for ok, _ in resultados):
             self.log(f"acesso a {recurso} cancelado: um nó não respondeu a tempo")
             self.sair(recurso)
-            return False
+            return False, []
 
         with self._cond:
             self._estado[recurso] = (DENTRO, ts)
         self.log(f"ENTROU na seção crítica de {recurso}")
-        return True
+        return True, [info for _, info in resultados if info is not None]
 
-    def _pedir(self, destino, recurso, ts) -> bool:
+    def _pedir(self, destino, recurso, ts):
         try:
-            relogio_resposta = self.rede.pedir_acesso(destino, recurso, self.meu_id, ts)
+            relogio_resposta, info = self.rede.pedir_acesso(destino, recurso, self.meu_id, ts)
             self.relogio.atualizar(relogio_resposta)
-            return True
+            return True, info
         except NoIndisponivel:
             # Nó desligado: ele não vende nada, então não precisa permitir.
-            return True
+            return True, None
         except TempoEsgotado:
-            return False
+            return False, None
 
     def sair(self, recurso: str):
         """Sai da seção crítica e libera as respostas que estavam seguradas."""
@@ -112,7 +121,8 @@ class ExclusaoMutua:
     # ------------------------------------------------------------------
     # Lado de quem RECEBE o pedido
     # ------------------------------------------------------------------
-    def ao_receber_pedido(self, recurso: str, origem: int, ts_pedido: int) -> int:
+    def ao_receber_pedido(self, recurso: str, origem: int, ts_pedido: int):
+        """Devolve (relogio, info sobre o recurso) quando permite o acesso."""
         self.relogio.atualizar(ts_pedido)
 
         def devo_esperar():
@@ -131,4 +141,6 @@ class ExclusaoMutua:
                          f"(pedido dele ts={ts_pedido})")
                 self._cond.wait_for(lambda: not devo_esperar())
                 self.log(f"libera o nó {origem} para {recurso}")
-        return self.relogio.tick()
+        # A consulta vem DEPOIS da espera: se este nó acabou de vender o
+        # recurso, a venda já vai junto com a permissão.
+        return self.relogio.tick(), self.consultar_recurso(recurso)

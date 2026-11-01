@@ -20,12 +20,15 @@ class NoIndisponivel(Exception):
 
 
 class TempoEsgotado(Exception):
-    """O nó de destino está ativo, mas não respondeu a tempo."""
+    """O nó não respondeu a tempo, ou respondeu com erro.
+    Não prova que o nó está desligado, então a operação deve ser cancelada."""
 
 
 class Rede:
     # ----- Exclusão mútua -----
-    def pedir_acesso(self, destino: int, recurso: str, origem: int, relogio: int) -> int:
+    def pedir_acesso(self, destino: int, recurso: str, origem: int, relogio: int):
+        """Devolve (relogio, info). info = o que o destino sabe sobre o recurso
+        (para um assento: (comprador, no_origem, relogio_venda)) ou None."""
         raise NotImplementedError
 
     # ----- Replicação -----
