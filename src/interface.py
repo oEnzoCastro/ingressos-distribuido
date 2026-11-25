@@ -1,4 +1,4 @@
-"""Painel local para três nós e um cliente, todos em processos separados.
+"""Painel local para um a cinco nós e um cliente, em processos separados.
 
 Executar na raiz do projeto: python src/interface.py
 Antes do primeiro uso: pip install -r requirements.txt && python gerar_proto.py
@@ -27,10 +27,92 @@ from tkinter import messagebox, scrolledtext, ttk
 
 
 RAIZ = Path(__file__).resolve().parent.parent
-ENDERECOS = [f"localhost:{50051 + i}" for i in range(3)]
-PEERS = ",".join(f"{i + 1}={e}" for i, e in enumerate(ENDERECOS))
+ENDERECOS = [f"localhost:{50051 + i}" for i in range(5)]
 ASSENTOS_DESEMPENHO = tuple(f"{f}{c}" for f in "ABCDE" for c in range(1, 101))
 COMPRAS_DESEMPENHO = 1000
+_JOB_PROCESSOS = None
+_LOCK_JOB = threading.Lock()
+
+
+class _GrupoProcessosWindows:
+    """O Windows encerra os filhos se a interface sair, inclusive pelo editor."""
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+
+        class LimitesBasicos(ctypes.Structure):
+            _fields_ = [
+                ("tempo_processo", ctypes.c_longlong), ("tempo_job", ctypes.c_longlong),
+                ("flags", wintypes.DWORD), ("memoria_minima", ctypes.c_size_t),
+                ("memoria_maxima", ctypes.c_size_t), ("processos", wintypes.DWORD),
+                ("afinidade", ctypes.c_size_t), ("prioridade", wintypes.DWORD),
+                ("escalonamento", wintypes.DWORD),
+            ]
+
+        class ContadoresIO(ctypes.Structure):
+            _fields_ = [(nome, ctypes.c_ulonglong) for nome in (
+                "leituras", "escritas", "outras", "bytes_lidos", "bytes_escritos", "bytes_outros")]
+
+        class LimitesEstendidos(ctypes.Structure):
+            _fields_ = [("basicos", LimitesBasicos), ("io", ContadoresIO),
+                        ("memoria_processo", ctypes.c_size_t), ("memoria_job", ctypes.c_size_t),
+                        ("pico_processo", ctypes.c_size_t), ("pico_job", ctypes.c_size_t)]
+
+        self.api = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.api.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        self.api.CreateJobObjectW.restype = wintypes.HANDLE
+        self.api.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        self.api.SetInformationJobObject.restype = wintypes.BOOL
+        self.api.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        self.api.AssignProcessToJobObject.restype = wintypes.BOOL
+        self.api.CloseHandle.argtypes = [wintypes.HANDLE]
+        self.api.CloseHandle.restype = wintypes.BOOL
+        self.handle = self.api.CreateJobObjectW(None, None)
+        if not self.handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        limites = LimitesEstendidos()
+        limites.basicos.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not self.api.SetInformationJobObject(self.handle, 9, ctypes.byref(limites), ctypes.sizeof(limites)):
+            erro = ctypes.get_last_error()
+            self.api.CloseHandle(self.handle)
+            raise ctypes.WinError(erro)
+
+    def adicionar(self, processo):
+        import ctypes
+
+        if not self.api.AssignProcessToJobObject(self.handle, int(processo._handle)):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _iniciar_processo(*args, **kwargs):
+    global _JOB_PROCESSOS
+    processo = subprocess.Popen(*args, **kwargs)
+    if os.name == "nt":
+        try:
+            with _LOCK_JOB:
+                if _JOB_PROCESSOS is None:
+                    _JOB_PROCESSOS = _GrupoProcessosWindows()
+                _JOB_PROCESSOS.adicionar(processo)
+        except OSError:
+            processo.terminate()
+            processo.wait()
+            for fluxo in (processo.stdin, processo.stdout, processo.stderr):
+                if fluxo:
+                    fluxo.close()
+            raise
+    return processo
+
+
+def _porta_disponivel(porta):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as teste:
+        if os.name == "nt":
+            teste.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        try:
+            teste.bind(("0.0.0.0", porta))
+            return True
+        except OSError:
+            return False
 
 
 class TesteCancelado(Exception):
@@ -119,7 +201,7 @@ class ExecutorDesempenho:
                     with self._lock:
                         self._checar()
                         reserva.close()
-                        processo = subprocess.Popen([
+                        processo = _iniciar_processo([
                             sys.executable, "-u", str(Path(__file__).resolve()), "--no-desempenho",
                             "--id", str(i), "--porta", porta, "--peers", peers,
                             "--atraso", "0", "--dados", str(Path(pasta) / "dados"),
@@ -316,7 +398,7 @@ class PaginaDesempenho(ttk.Frame):
             "Réplicas são comparadas imediatamente após o teste. "
             "Todos os processos rodam nesta máquina; evite outras compras durante a medição."
         ), wraplength=900, justify="left").grid(row=8, column=0, sticky="ew", pady=(10, 0))
-        self.after(100, self._consumir)
+        self._tarefa_consumir = self.after(100, self._consumir)
 
     def iniciar(self, cenarios):
         if self.thread and self.thread.is_alive():
@@ -414,7 +496,7 @@ class PaginaDesempenho(ttk.Frame):
             elif tipo == "fim":
                 self._ocupado(False)
         if not self.app.fechando.is_set():
-            self.after(100, self._consumir)
+            self._tarefa_consumir = self.after(100, self._consumir)
 
 
 class Terminal:
@@ -464,11 +546,18 @@ class Terminal:
     def iniciar(self):
         if self.parando or (self.processo and self.processo.poll() is None):
             return
+        if not self.cliente:
+            porta = int(self.comando[self.comando.index("--porta") + 1])
+            if not _porta_disponivel(porta):
+                self.estado.set(f"Porta {porta} indisponível")
+                self.escrever(f"\nA porta {porta} já está em uso ou indisponível. "
+                              "Encerre o servidor anterior ou a outra interface antes de iniciar este nó.\n")
+                return
         if not self.app.dependencias_ok():
             return
         ambiente = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
         try:
-            self.processo = subprocess.Popen(
+            self.processo = _iniciar_processo(
                 [sys.executable, "-u", *self.comando], cwd=RAIZ, env=ambiente,
                 stdin=subprocess.PIPE if self.cliente else subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -481,6 +570,7 @@ class Terminal:
         self.estado.set("Processo iniciado")
         self.iniciar_btn.configure(state="disabled")
         self.parar_btn.configure(state="normal")
+        self.app._atualizar_seletor()
         self.escrever("\n--- Processo iniciado ---\n")
         threading.Thread(target=self._ler, args=(self.processo,), daemon=True).start()
 
@@ -535,6 +625,7 @@ class Terminal:
         self.iniciar_btn.configure(state="normal")
         self.parar_btn.configure(state="disabled")
         self.escrever(f"\n--- Processo encerrado: {codigo} ---\n")
+        self.app._atualizar_seletor()
 
 
 class Interface:
@@ -544,6 +635,7 @@ class Interface:
         self.fechando = threading.Event()
         self.no_mapa = 1  # Cópia simples: o worker não acessa widgets Tk.
         self.rpc = None
+        self.config_operacao = (0, tuple(ENDERECOS[:3]))
         janela.title("Ingressos distribuídos | Controle dos processos")
         janela.geometry("1380x900")
         janela.minsize(1000, 720)
@@ -555,7 +647,7 @@ class Interface:
         self.desempenho = PaginaDesempenho(self.paginas, self)
         self.paginas.add(self.desempenho, text="Desempenho")
         janela.columnconfigure(0, weight=1)
-        janela.rowconfigure(2, weight=1)
+        janela.rowconfigure(3, weight=1)
 
         barra = ttk.Frame(janela, padding=10)
         barra.grid(row=0, column=0, sticky="ew")
@@ -565,8 +657,19 @@ class Interface:
         ttk.Button(barra, text="Parar todos", command=self.parar_todos).pack(side="right", padx=4)
         ttk.Label(barra, text="Para reiniciar um nó: Parar → Iniciar").pack(side="right", padx=12)
 
+        configuracao = ttk.Frame(janela, padding=(10, 0, 10, 8))
+        configuracao.grid(row=1, column=0, sticky="ew")
+        ttk.Label(configuracao, text="Quantidade de nós:").pack(side="left")
+        self.quantidade_nos = tk.StringVar(value="3")
+        self.seletor_quantidade = ttk.Combobox(configuracao, textvariable=self.quantidade_nos,
+                                             values=("1", "2", "3", "4", "5"), width=3, state="readonly")
+        self.seletor_quantidade.pack(side="left", padx=6)
+        self.seletor_quantidade.bind("<<ComboboxSelected>>", self._configurar_operacao)
+        self.config_resumo = tk.StringVar()
+        ttk.Label(configuracao, textvariable=self.config_resumo).pack(side="left", padx=10)
+
         mapa = ttk.LabelFrame(janela, text="Mapa de assentos — clique para selecionar", padding=8)
-        mapa.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
+        mapa.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 8))
         esquerda = ttk.Frame(mapa)
         esquerda.pack(side="left")
         self.assentos = {}
@@ -592,27 +695,32 @@ class Interface:
         self.detalhe = tk.StringVar(value="")
         ttk.Label(direita, textvariable=self.detalhe).pack(anchor="w")
 
-        grade = ttk.Frame(janela, padding=(10, 0, 10, 10))
-        grade.grid(row=2, column=0, sticky="nsew")
+        area = ttk.Frame(janela)
+        area.grid(row=3, column=0, sticky="nsew")
+        area.rowconfigure(0, weight=1)
+        area.columnconfigure(0, weight=1)
+        self.canvas_terminais = tk.Canvas(area, highlightthickness=0)
+        self.canvas_terminais.grid(row=0, column=0, sticky="nsew")
+        rolagem = ttk.Scrollbar(area, orient="vertical", command=self.canvas_terminais.yview)
+        rolagem.grid(row=0, column=1, sticky="ns")
+        self.canvas_terminais.configure(yscrollcommand=rolagem.set)
+        grade = ttk.Frame(self.canvas_terminais, padding=(10, 0, 10, 10))
+        self.grade_terminais = grade
+        conteudo = self.canvas_terminais.create_window((0, 0), window=grade, anchor="nw")
+        grade.bind("<Configure>", lambda _: self.canvas_terminais.configure(
+            scrollregion=self.canvas_terminais.bbox("all")))
+        self.canvas_terminais.bind("<Configure>", lambda e: self.canvas_terminais.itemconfigure(conteudo, width=e.width))
         for i in range(2):
-            grade.rowconfigure(i, weight=1)
             grade.columnconfigure(i, weight=1)
+        self.terminais_nos = [Terminal(self, grade, f"Nó {i} · {endereco}", [])
+                              for i, endereco in enumerate(ENDERECOS, 1)]
+        self.cliente = Terminal(self, grade, "Cliente · comandos e resultados", [], cliente=True)
         self.terminais = []
-        for i in range(1, 4):
-            terminal = Terminal(self, grade, f"Nó {i} · {ENDERECOS[i - 1]}", [
-                "src/servidor.py", "--id", str(i), "--porta", str(50050 + i),
-                "--peers", PEERS, "--atraso", "3",
-            ])
-            self.terminais.append(terminal)
-        self.cliente = Terminal(self, grade, "Cliente · comandos e resultados",
-                                ["src/cliente.py", *ENDERECOS], cliente=True)
-        self.terminais.append(self.cliente)
-        for i, terminal in enumerate(self.terminais):
-            terminal.frame.grid(row=i // 2, column=i % 2, sticky="nsew", padx=4, pady=4)
         self._controles_cliente()
         self.vendidos = None
         self.assento.trace_add("write", lambda *_: self._detalhar())
-        self.janela.after(80, self._consumir)
+        self._configurar_operacao()
+        self._tarefa_consumir = self.janela.after(80, self._consumir)
         threading.Thread(target=self._monitorar, daemon=True).start()
 
     def _controles_cliente(self):
@@ -622,7 +730,8 @@ class Interface:
         self.assento = tk.StringVar(value="A1")
         self.comprador = tk.StringVar(value="Maria")
         ttk.Label(painel, text="Nó / mapa").pack(side="left")
-        seletor = ttk.Combobox(painel, textvariable=self.no, values=("1", "2", "3"), width=3, state="readonly")
+        seletor = ttk.Combobox(painel, textvariable=self.no, width=3, state="readonly")
+        self.seletor_no = seletor
         seletor.pack(side="left", padx=4)
         seletor.bind("<<ComboboxSelected>>", self._trocar_no)
         ttk.Entry(painel, textvariable=self.assento, width=5).pack(side="left", padx=4)
@@ -643,6 +752,49 @@ class Interface:
         self.comando.grid(row=0, column=0, sticky="ew")
         self.comando.bind("<Return>", self._enviar)
         ttk.Button(entrada, text="Enviar", command=self._enviar).grid(row=0, column=1, padx=4)
+
+    def _processos_operacao_ativos(self):
+        return any(t.parando or (t.processo and t.processo.poll() is None)
+                   for t in [*self.terminais_nos, self.cliente])
+
+    def _atualizar_seletor(self):
+        self.seletor_quantidade.configure(state="disabled" if self._processos_operacao_ativos() else "readonly")
+
+    def _configurar_operacao(self, _evento=None):
+        versao, anteriores = self.config_operacao
+        if self._processos_operacao_ativos():
+            self.quantidade_nos.set(str(len(anteriores)))
+            return
+        quantidade = int(self.quantidade_nos.get())
+        if quantidade not in range(1, 6):
+            self.quantidade_nos.set(str(len(anteriores)))
+            return
+        enderecos = tuple(ENDERECOS[:quantidade])
+        peers = ",".join(f"{i}={e}" for i, e in enumerate(enderecos, 1))
+        for i, terminal in enumerate(self.terminais_nos, 1):
+            terminal.frame.grid_forget()
+            terminal.comando = ["src/servidor.py", "--id", str(i), "--porta", ENDERECOS[i - 1].rsplit(":", 1)[1],
+                                "--peers", peers, "--atraso", "3"]
+        self.cliente.frame.grid_forget()
+        self.cliente.comando = ["src/cliente.py", *enderecos]
+        self.terminais = [*self.terminais_nos[:quantidade], self.cliente]
+        for linha in range(3):
+            self.grade_terminais.rowconfigure(linha, weight=0, minsize=0)
+        for i, terminal in enumerate(self.terminais):
+            linha = i // 2
+            self.grade_terminais.rowconfigure(linha, minsize=260)
+            terminal.frame.grid(row=linha, column=i % 2, sticky="nsew", padx=4, pady=4)
+        self.canvas_terminais.yview_moveto(0)
+        self.seletor_no.configure(values=tuple(str(i) for i in range(1, quantidade + 1)))
+        if int(self.no.get()) > quantidade:
+            self.no.set("1")
+        self.no_mapa = int(self.no.get())
+        self.config_operacao = (versao + 1, enderecos)
+        self.config_resumo.set(f"{quantidade} nó(s) + cliente | quórum {quantidade // 2 + 1}/{quantidade} | Pare todos para alterar.")
+        self.resumo.set("Inicie os processos da configuração selecionada.")
+        self.quorum.set(f"Mínimo para vender: {quantidade // 2 + 1} de {quantidade} nós.")
+        self._pintar_mapa(None)
+        self._atualizar_seletor()
 
     def _trocar_no(self, _evento=None):
         self.no_mapa = int(self.no.get())
@@ -688,6 +840,18 @@ class Interface:
             raise RuntimeError("Protocolo gerado desatualizado para a versão com quórum.")
 
     def iniciar_todos(self):
+        ocupadas = []
+        for terminal in self.terminais[:-1]:
+            if terminal.processo and terminal.processo.poll() is None:
+                continue
+            porta = int(terminal.comando[terminal.comando.index("--porta") + 1])
+            if not _porta_disponivel(porta):
+                ocupadas.append(str(porta))
+        if ocupadas:
+            messagebox.showerror("Portas indisponíveis", "Não foi possível iniciar o conjunto de nós.\n\n"
+                                 f"Portas ocupadas ou indisponíveis: {', '.join(ocupadas)}.\n\n"
+                                 "Encerre os servidores da execução anterior ou a outra interface e tente novamente.")
+            return
         if self.dependencias_ok():
             for terminal in self.terminais:
                 terminal.iniciar()
@@ -698,18 +862,24 @@ class Interface:
 
     def _monitorar(self):
         canais = []
+        configuracao_rpc = None
         try:
             while not self.fechando.is_set():
                 try:
-                    if self.rpc is None:
+                    configuracao = self.config_operacao
+                    versao, enderecos = configuracao
+                    if self.rpc is None or configuracao_rpc != configuracao:
                         grpc = importlib.import_module("grpc")
                         pb = importlib.import_module("ingressos_pb2")
                         pb_grpc = importlib.import_module("ingressos_pb2_grpc")
                         self._validar_protocolo(pb)
+                        for canal in canais:
+                            canal.close()
                         canais = [grpc.insecure_channel(e, options=[
                             ("grpc.max_reconnect_backoff_ms", 1000),
-                        ]) for e in ENDERECOS]
+                        ]) for e in enderecos]
                         self.rpc = (grpc, pb, [pb_grpc.NoIngressosStub(c) for c in canais])
+                        configuracao_rpc = configuracao
                     grpc, pb, stubs = self.rpc
                     linhas = []
                     configuracoes = set()
@@ -736,16 +906,16 @@ class Interface:
                         mensagem = "Os nós consultados informam configurações de quórum diferentes."
                     else:
                         mensagem = f"Quórum não informado. Respondendo ao painel: {respondendo}."
-                    self.eventos.put(("quorum", mensagem, None, None))
-                    escolhido = self.no_mapa
+                    self.eventos.put(("quorum", mensagem, versao, None))
+                    escolhido = min(self.no_mapa, len(stubs))
                     try:
                         estado = stubs[escolhido - 1].ConsultarMapa(pb.Vazio(), timeout=0.5)
                         vendidos = {v.assento: v.comprador for v in estado.vendidos}
                     except grpc.RpcError:
                         vendidos = None
-                    self.eventos.put(("status", "\n".join(linhas), escolhido, vendidos))
+                    self.eventos.put(("status", "\n".join(linhas), (versao, escolhido), vendidos))
                 except (ImportError, RuntimeError):
-                    self.eventos.put(("quorum", "Prepare as dependências e execute gerar_proto.py; depois reabra a interface.", None, None))
+                    self.eventos.put(("quorum", "Prepare as dependências e execute gerar_proto.py; depois reabra a interface.", versao, None))
                 self.fechando.wait(2)
         finally:
             for canal in canais:
@@ -784,18 +954,24 @@ class Interface:
                     alvo.escrever("".join(textos.pop(alvo)))
                 alvo.terminou(processo, dado)
             elif tipo == "status":
-                self.resumo.set(alvo)
-                if processo == self.no_mapa:
-                    self._pintar_mapa(dado)
+                versao, escolhido = processo
+                if versao == self.config_operacao[0]:
+                    self.resumo.set(alvo)
+                    if escolhido == self.no_mapa:
+                        self._pintar_mapa(dado)
             elif tipo == "quorum":
-                self.quorum.set(alvo)
+                if processo == self.config_operacao[0]:
+                    self.quorum.set(alvo)
         for terminal, partes in textos.items():
             terminal.escrever("".join(partes))
+        self._atualizar_seletor()
         if not self.fechando.is_set():
-            self.janela.after(80, self._consumir)
+            self._tarefa_consumir = self.janela.after(80, self._consumir)
 
     def fechar(self):
         self.fechando.set()
+        self.janela.after_cancel(self._tarefa_consumir)
+        self.desempenho.after_cancel(self.desempenho._tarefa_consumir)
         self.desempenho.cancelar()
         self.parar_todos()
         self.limite_fechar = time.monotonic() + 5
