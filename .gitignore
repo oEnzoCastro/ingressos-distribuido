@@ -24,3 +24,6 @@ desktop.ini
 
 # Logs salvos dos testes
 *.log
+
+# Vendas gravadas por cada nó (persistência)
+dados/

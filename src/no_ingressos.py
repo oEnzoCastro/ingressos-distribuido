@@ -13,26 +13,34 @@ Fluxo de uma compra no nó N:
   1. Confere se as vendas estão abertas e se o assento existe.
   2. Pede acesso exclusivo ao assento (Ricart-Agrawala).
   3. Dentro da seção crítica: confere se o assento está livre.
-  4. Se está livre: grava a venda e REPLICA para todos os outros nós.
+  4. Replicação com QUÓRUM (Entrega 2), em duas fases:
+       4a. Pede a todos os nós que RESERVEM o assento para esta venda.
+           Cada nó aceita no máximo uma reserva por assento.
+       4b. Se a MAIORIA aceitou (2 de 3): CONFIRMA a venda em todos.
+           Se não: CANCELA as reservas e recusa a compra.
   5. Sai da seção crítica.
 
-Como a réplica acontece ANTES de sair da seção crítica, o próximo nó que
-entrar já vê o assento como vendido.
+Por que o quórum? A exclusão mútua trata um nó sem resposta como
+desligado. Se a rede se divide, os dois lados poderiam vender o mesmo
+assento. Com o quórum, só o lado com a maioria consegue vender: duas
+maiorias sempre têm um nó em comum, e esse nó só aceita uma reserva.
 
-E se a réplica não chegou (falha rápida de rede)? Cada nó que dá a
-permissão no passo 2 conta junto se já sabe que o assento foi vendido.
-Assim, o nó que perdeu a réplica corrige a sua cópia antes do passo 3.
+E se a confirmação não chegou a um nó (falha rápida de rede)? Cada nó que
+dá a permissão no passo 2 conta junto se já sabe que o assento foi vendido.
+Assim, o nó que perdeu a confirmação corrige a sua cópia antes do passo 3.
 
-Se duas vendas do mesmo assento se encontram (só numa divisão longa da
-rede), vale a venda que veio primeiro na ordem de Lamport: menor
+Se duas vendas do mesmo assento se encontram ao copiar o estado de outro
+nó, vale a venda que veio primeiro na ordem de Lamport: menor
 (relogio_venda, no_origem). Todas as cópias escolhem a mesma.
 """
 
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from eleicao_bully import EleicaoBully
 from exclusao_mutua import ExclusaoMutua
+from persistencia import Persistencia
 from rede import NoIndisponivel, TempoEsgotado
 from relogio_lamport import RelogioLamport
 
@@ -44,10 +52,14 @@ ASSENTOS = [f"{f}{c}" for f in FILEIRAS for c in range(1, COLUNAS + 1)]
 class NoIngressos:
     def __init__(self, meu_id, todos_ids, rede, intervalo_heartbeat=2.0,
                  limite_inativo=6.0, espera_coordenador=3.0,
-                 atraso_secao_critica=0.0, vendas_abertas=False, verbose=True):
+                 atraso_secao_critica=0.0, vendas_abertas=False, verbose=True,
+                 arquivo_dados=None, reserva_expira=10.0):
         self.meu_id = meu_id
         self.todos_ids = sorted(todos_ids)
         self.ids_outros = [i for i in self.todos_ids if i != meu_id]
+        # Quórum = maioria dos nós configurados, contando este (3 nós -> 2).
+        self.maioria = len(self.todos_ids) // 2 + 1
+        self.reserva_expira = reserva_expira
         self.rede = rede
         self.intervalo_heartbeat = intervalo_heartbeat
         self.limite_inativo = limite_inativo
@@ -63,8 +75,13 @@ class NoIngressos:
 
         # Dados replicados
         self._lock_dados = threading.Lock()
-        self.vendidos = {}  # assento -> (comprador, no_origem, relogio)
+        self.vendidos = {}  # assento -> (comprador, no_origem, relogio) CONFIRMADAS
+        # Reservas da fase 1 do quórum: assento -> (venda, instante em que expira).
+        # Se quem reservou cair antes da fase 2, a reserva expira sozinha.
+        self.reservas = {}
         self.vendas_abertas = vendas_abertas
+        self.persistencia = Persistencia(arquivo_dados)
+        self._pool = ThreadPoolExecutor(max_workers=max(4, len(self.ids_outros) * 4))
 
         # Lista de nós ativos (mantida pelo líder)
         self._ultimo_contato = {}
@@ -96,7 +113,9 @@ class NoIngressos:
     # ------------------------------------------------------------------
     def iniciar(self):
         self._rodando = True
-        self.log(f"nó iniciado; outros nós: {self.ids_outros}")
+        self.log(f"nó iniciado; outros nós: {self.ids_outros}; quórum = "
+                 f"{self.maioria} de {len(self.todos_ids)}")
+        self._carregar_do_disco()
         self._sincronizar_estado()
         self._thread_monitor = threading.Thread(target=self._monitorar, daemon=True)
         self._thread_monitor.start()
@@ -104,8 +123,22 @@ class NoIngressos:
     def parar(self):
         self._rodando = False
 
+    def _carregar_do_disco(self):
+        """Lê as vendas confirmadas gravadas antes de o nó cair."""
+        vendidos, abertas = self.persistencia.carregar()
+        if not vendidos and not abertas:
+            return
+        with self._lock_dados:
+            self.vendidos.update(vendidos)
+            self.vendas_abertas = abertas
+        # O relógio volta a partir da maior venda gravada.
+        self.relogio.atualizar(max((v[2] for v in vendidos.values()), default=0))
+        self.log(f"estado lido do disco: {len(vendidos)} assentos vendidos")
+
     def _sincronizar_estado(self):
-        """Ao iniciar, copia o mapa de assentos de qualquer nó ativo."""
+        """Ao iniciar, junta o mapa de assentos de TODOS os nós ativos.
+        Assim, o nó recebe as vendas confirmadas enquanto estava fora."""
+        copiou_de = []
         for destino in self.ids_outros:
             try:
                 vendidos, abertas, rel = self.rede.obter_estado(destino)
@@ -115,10 +148,16 @@ class NoIngressos:
             with self._lock_dados:
                 for assento, venda in vendidos.items():
                     self._mesclar_venda(assento, venda, "réplica")
-                self.vendas_abertas = abertas
-            self.log(f"estado copiado do nó {destino}: {len(vendidos)} assentos vendidos")
-            return
-        self.log("nenhum outro nó ativo; começa com o mapa vazio")
+                if not copiou_de:
+                    self.vendas_abertas = abertas
+            copiou_de.append(destino)
+        if copiou_de:
+            with self._lock_dados:
+                total = len(self.vendidos)
+                self._gravar_disco()
+            self.log(f"estado sincronizado com os nós {copiou_de}: {total} assentos vendidos")
+        else:
+            self.log("nenhum outro nó ativo; segue com o estado local")
 
     def _monitorar(self):
         """Laço de fundo. Um erro inesperado não pode matar este laço:
@@ -131,9 +170,12 @@ class NoIngressos:
                 time.sleep(self.intervalo_heartbeat)
 
     def _ciclo_monitor(self):
-        """Heartbeat para o líder e detecção de falha."""
+        """Heartbeat para o líder, detecção de falha e sincronização periódica."""
         falhas_seguidas = 0
+        ciclo = 0
         while self._rodando:
+            ciclo += 1
+            sincronizar = ciclo % self.CICLOS_ENTRE_SINCRONIAS == 0
             lider = self.eleicao.lider
             if lider is None:
                 falhas_seguidas = 0
@@ -141,6 +183,10 @@ class NoIngressos:
             elif lider == self.meu_id:
                 self._atualizar_ativos()
                 self._conferir_nos_maiores()
+                if sincronizar:
+                    # O líder junta as vendas de todos os nós ativos...
+                    for destino in [i for i in self.ativos if i != self.meu_id]:
+                        self._sincronizar_com(destino)
             else:
                 try:
                     lider_dele, ativos, rel = self.rede.heartbeat(
@@ -149,6 +195,9 @@ class NoIngressos:
                     falhas_seguidas = 0
                     if lider_dele == lider and ativos:
                         self.ativos = ativos
+                    if sincronizar:
+                        # ...e cada nó copia do líder o que estiver faltando.
+                        self._sincronizar_com(lider)
                 except (NoIndisponivel, TempoEsgotado):
                     # Uma falha isolada pode ser só a rede se reconectando.
                     # O líder só é considerado morto após FALHAS_PARA_SUSPEITAR seguidas.
@@ -162,6 +211,26 @@ class NoIngressos:
             time.sleep(self.intervalo_heartbeat)
 
     FALHAS_PARA_SUSPEITAR = 2
+    # Sincronização periódica (anti-entropia): a cada 3 heartbeats (~6 s).
+    CICLOS_ENTRE_SINCRONIAS = 3
+
+    def _sincronizar_com(self, destino):
+        """Anti-entropia: copia de 'destino' as vendas confirmadas que este nó
+        não tem. Corrige confirmações perdidas sem esperar alguém pedir o assento."""
+        try:
+            vendidos, _, rel = self.rede.obter_estado(destino)
+        except (NoIndisponivel, TempoEsgotado):
+            return
+        self.relogio.atualizar(rel)
+        with self._lock_dados:
+            faltando = {a: v for a, v in vendidos.items() if self.vendidos.get(a) != v}
+            for assento, venda in faltando.items():
+                self._mesclar_venda(assento, venda, "réplica")
+            if faltando:
+                self._gravar_disco()
+        if faltando:
+            self.log(f"sincronização com o nó {destino}: {len(faltando)} venda(s) "
+                     f"corrigida(s): {sorted(faltando)}")
 
     def _conferir_nos_maiores(self):
         """Regra do Bully: o líder deve ser o MAIOR nó ativo.
@@ -218,20 +287,116 @@ class NoIngressos:
                     dono = self.vendidos[assento][0]
                     self.log(f"compra RECUSADA: {assento} já é de {dono}")
                     return False, f"Assento {assento} já foi vendido para {dono}", self.relogio.valor
-                ts = self.relogio.tick()
-                self.vendidos[assento] = (comprador, self.meu_id, ts)
-            self.log(f"VENDEU {assento} para {comprador}")
-
-            for destino in self.ids_outros:
-                try:
-                    rel = self.rede.replicar_venda(destino, assento, comprador,
-                                                   self.meu_id, ts, self.relogio.tick())
-                    self.relogio.atualizar(rel)
-                except (NoIndisponivel, TempoEsgotado):
-                    self.log(f"réplica para o nó {destino} falhou (nó fora do ar)")
-            return True, f"Assento {assento} vendido para {comprador}", ts
+            venda = (comprador, self.meu_id, self.relogio.tick())
+            return self._vender_com_quorum(assento, venda)
         finally:
             self.mutex.sair(assento)
+
+    # ------------------------------------------------------------------
+    # Replicação com quórum (Entrega 2)
+    # ------------------------------------------------------------------
+    def _vender_com_quorum(self, assento, venda):
+        """Fase 1: reserva em todos. Fase 2: confirma (maioria) ou cancela."""
+        comprador, _, ts = venda
+
+        # Fase 1, no próprio nó: a mesma regra que os outros nós aplicam.
+        aceita, motivo, atual = self._reservar(assento, venda)
+        if not aceita:
+            return self._recusar(assento, motivo, atual)
+        aceitaram, recusas, sem_resposta = [self.meu_id], [], []
+
+        # Fase 1, nos outros nós, em paralelo.
+        def reservar_em(destino):
+            try:
+                ok, mot, atu, rel = self.rede.reservar_assento(
+                    destino, assento, venda, self.relogio.tick())
+                self.relogio.atualizar(rel)
+                return destino, ok, mot, atu
+            except (NoIndisponivel, TempoEsgotado):
+                return destino, None, None, None
+
+        for destino, ok, mot, atu in self._pool.map(reservar_em, self.ids_outros):
+            if ok:
+                aceitaram.append(destino)
+            elif ok is None:
+                sem_resposta.append(destino)
+            else:
+                recusas.append((destino, mot, atu))
+
+        # Fase 2a: maioria -> confirma em todos.
+        if len(aceitaram) >= self.maioria:
+            self.log(f"quórum atingido para {assento}: nós {sorted(aceitaram)} aceitaram "
+                     f"({len(aceitaram)} de {len(self.todos_ids)}, mínimo {self.maioria})")
+            with self._lock_dados:
+                self.reservas.pop(assento, None)
+                self.vendidos[assento] = venda
+                self._gravar_disco()
+            self.log(f"VENDEU {assento} para {comprador}")
+            self._em_todos(lambda d: self.rede.confirmar_venda(
+                d, assento, venda, self.relogio.tick()), "confirmação")
+            return True, f"Assento {assento} vendido para {comprador}", ts
+
+        # Fase 2b: sem maioria -> desfaz as reservas que foram aceitas.
+        self.log(f"SEM QUÓRUM para {assento}: só {sorted(aceitaram)} aceitaram "
+                 f"(mínimo {self.maioria}); sem resposta: {sem_resposta}")
+        self._cancelar_local(assento, venda)
+        # Também tenta quem não respondeu: a reserva pode ter chegado e a
+        # resposta se perdido. Se o nó estiver fora, a reserva expira sozinha.
+        a_cancelar = [d for d in aceitaram if d != self.meu_id] + sem_resposta
+        self._em_todos(lambda d: self.rede.cancelar_reserva(
+            d, assento, venda, self.relogio.tick()), "cancelamento", a_cancelar)
+        for _, mot, atu in recusas:
+            if mot == "vendido":
+                with self._lock_dados:
+                    self._mesclar_venda(assento, atu, "recusa de reserva")
+                return self._recusar(assento, mot, atu)
+        if recusas:
+            return self._recusar(assento, "reservado", recusas[0][2])
+        return (False, f"Sem quórum: só {len(aceitaram)} de {len(self.todos_ids)} nós "
+                f"aceitaram (mínimo {self.maioria}). Venda não realizada.", self.relogio.valor)
+
+    def _em_todos(self, enviar, nome, destinos=None):
+        """Envia uma mensagem da fase 2 a vários nós em paralelo."""
+        def um(destino):
+            try:
+                self.relogio.atualizar(enviar(destino))
+            except (NoIndisponivel, TempoEsgotado):
+                self.log(f"{nome} para o nó {destino} falhou (nó fora do ar)")
+        list(self._pool.map(um, self.ids_outros if destinos is None else destinos))
+
+    def _recusar(self, assento, motivo, atual):
+        if motivo == "vendido":
+            self.log(f"compra RECUSADA: {assento} já é de {atual[0]}")
+            return False, f"Assento {assento} já foi vendido para {atual[0]}", self.relogio.valor
+        self.log(f"compra RECUSADA: {assento} está reservado para {atual[0]} (nó {atual[1]})")
+        return (False, f"Assento {assento} está em disputa com outra compra (tente de novo)",
+                self.relogio.valor)
+
+    def _reservar(self, assento, venda):
+        """Regra de cada nó na fase 1: aceita no máximo UMA reserva por assento.
+        Devolve (aceita, motivo, venda_atual)."""
+        with self._lock_dados:
+            agora = time.time()
+            if assento in self.vendidos:
+                atual = self.vendidos[assento]
+                return (True, "", None) if atual == venda else (False, "vendido", atual)
+            reserva = self.reservas.get(assento)
+            if reserva and reserva[0] != venda and reserva[1] > agora:
+                return False, "reservado", reserva[0]
+            self.reservas[assento] = (venda, agora + self.reserva_expira)
+            return True, "", None
+
+    def _cancelar_local(self, assento, venda):
+        with self._lock_dados:
+            if self.reservas.get(assento, (None,))[0] == venda:
+                del self.reservas[assento]
+
+    def _gravar_disco(self):
+        """Chamar com self._lock_dados já adquirido."""
+        try:
+            self.persistencia.salvar(self.vendidos, self.vendas_abertas)
+        except OSError as erro:
+            self.log(f"erro ao gravar no disco: {erro!r}")
 
     def alterar_vendas(self, abertas: bool, relogio: int = 0):
         """Só o líder abre/fecha as vendas. Outros nós repassam ao líder.
@@ -252,6 +417,7 @@ class NoIngressos:
         self.log(f"LÍDER decide {acao} as vendas")
         with self._lock_dados:
             self.vendas_abertas = abertas
+            self._gravar_disco()
         for destino in self.ids_outros:
             try:
                 rel = self.rede.definir_vendas(destino, abertas, self.relogio.tick())
@@ -273,16 +439,43 @@ class NoIngressos:
             "vendas_abertas": self.vendas_abertas,
             "vendidos": len(self.vendidos),
             "total_assentos": len(ASSENTOS),
+            "quorum": self.maioria,
+            "total_nos": len(self.todos_ids),
         }
 
     # ------------------------------------------------------------------
-    # Mensagens de outros nós
+    # Mensagens de outros nós: quórum
     # ------------------------------------------------------------------
-    def ao_receber_venda(self, assento, comprador, no_origem, relogio_venda, relogio):
+    def ao_receber_reserva(self, assento, venda, relogio):
+        """Fase 1 pedida por outro nó. Devolve (aceita, motivo, atual, relogio)."""
         self.relogio.atualizar(relogio)
-        self.log(f"réplica recebida: {assento} vendido pelo nó {no_origem} para {comprador}")
+        aceita, motivo, atual = self._reservar(assento, venda)
+        if aceita:
+            self.log(f"reserva ACEITA: {assento} para {venda[0]} (nó {venda[1]})")
+        else:
+            self.log(f"reserva RECUSADA: {assento} para {venda[0]} (nó {venda[1]}); "
+                     f"já {motivo} para {atual[0]}")
+        return aceita, motivo, atual, self.relogio.tick()
+
+    def ao_receber_confirmacao(self, assento, venda, relogio):
+        """Fase 2a: a maioria aceitou esta venda, então ela vale.
+        Substitui qualquer reserva diferente deste nó."""
+        self.relogio.atualizar(relogio)
         with self._lock_dados:
-            self._mesclar_venda(assento, (comprador, no_origem, relogio_venda), "réplica")
+            self.reservas.pop(assento, None)
+            anterior = self.vendidos.get(assento)
+            self.vendidos[assento] = venda
+            self._gravar_disco()
+        if anterior and anterior != venda:
+            self.log(f"confirmação substitui {anterior[0]} por {venda[0]} em {assento}")
+        self.log(f"confirmação recebida: {assento} vendido pelo nó {venda[1]} para {venda[0]}")
+        return self.relogio.tick()
+
+    def ao_receber_cancelamento(self, assento, venda, relogio):
+        """Fase 2b: a venda não teve maioria; desfaz a reserva dela, se houver."""
+        self.relogio.atualizar(relogio)
+        self._cancelar_local(assento, venda)
+        self.log(f"reserva cancelada: {assento} para {venda[0]} (nó {venda[1]})")
         return self.relogio.tick()
 
     # ------------------------------------------------------------------
@@ -317,6 +510,7 @@ class NoIngressos:
         self.relogio.atualizar(relogio)
         with self._lock_dados:
             self.vendas_abertas = abertas
+            self._gravar_disco()
         self.log(f"líder avisou: vendas {'ABERTAS' if abertas else 'FECHADAS'}")
         return self.relogio.tick()
 

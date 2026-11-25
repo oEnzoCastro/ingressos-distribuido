@@ -16,14 +16,21 @@ from no_ingressos import NoIngressos, ASSENTOS  # noqa: E402
 from relogio_lamport import RelogioLamport   # noqa: E402
 
 
-def criar_cluster(n=3, atraso=0.0, abertas=True, iniciar=True):
+def arquivo(pasta, no_id):
+    return os.path.join(pasta, f"no_{no_id}.json") if pasta else None
+
+
+def criar_cluster(n=3, atraso=0.0, abertas=True, iniciar=True, pasta_dados=None,
+                  reserva_expira=10.0):
     rede = RedeMemoria()
     ids = list(range(1, n + 1))
     for i in ids:
         rede.nos[i] = NoIngressos(i, ids, rede.visao(i), intervalo_heartbeat=0.2,
                                   limite_inativo=1.0, espera_coordenador=0.5,
                                   atraso_secao_critica=atraso,
-                                  vendas_abertas=abertas, verbose=False)
+                                  vendas_abertas=abertas, verbose=False,
+                                  arquivo_dados=arquivo(pasta_dados, i),
+                                  reserva_expira=reserva_expira)
     if iniciar:
         for i in ids:
             rede.nos[i].iniciar()
@@ -207,11 +214,105 @@ def test_conflito_resolvido_pela_ordem_de_lamport():
     com a mesma: a de menor (relogio_venda, no_origem), em qualquer ordem."""
     rede = criar_cluster(3, iniciar=False)
     a, b = ("Maria", 1, 40), ("João", 3, 42)
-    rede.nos[1].ao_receber_venda("C3", *a, relogio=50)
-    rede.nos[1].ao_receber_venda("C3", *b, relogio=51)
-    rede.nos[2].ao_receber_venda("C3", *b, relogio=50)
-    rede.nos[2].ao_receber_venda("C3", *a, relogio=51)
+    for no, ordem in ((rede.nos[1], (a, b)), (rede.nos[2], (b, a))):
+        with no._lock_dados:
+            for venda in ordem:
+                no._mesclar_venda("C3", venda, "réplica")
     assert rede.nos[1].vendidos["C3"] == rede.nos[2].vendidos["C3"] == a
+
+
+# ----------------------------------------------------------------------
+# Entrega 2: quórum (controle de réplicas) e persistência
+# ----------------------------------------------------------------------
+def test_no_isolado_nao_vende():
+    """Um nó isolado de todos não tem maioria: recusa vender.
+    O lado com a maioria (nós 2 e 3) continua vendendo."""
+    rede = criar_cluster(3)
+    assert esperar(lambda: set(lideres(rede).values()) == {3})
+    rede.isolar(1)
+    ok, msg, _ = rede.nos[1].comprar("E1", "Isolada")
+    assert not ok and "quórum" in msg.lower(), msg
+    assert "E1" not in rede.nos[1].vendidos and "E1" not in rede.nos[1].reservas
+    ok, msg, _ = rede.nos[2].comprar("E1", "Maioria")
+    assert ok, msg
+    assert rede.nos[3].vendidos["E1"][0] == "Maioria"
+
+
+def test_minoria_sobrevivente_nao_vende():
+    """Com 2 de 3 nós desligados, o nó que sobrou não tem quórum."""
+    rede = criar_cluster(3)
+    desligar(rede, 2)
+    desligar(rede, 3)
+    ok, msg, _ = rede.nos[1].comprar("E2", "Ana")
+    assert not ok and "quórum" in msg.lower(), msg
+
+
+def test_particao_assimetrica_sem_venda_dupla():
+    """Os nós 1 e 2 não se falam, mas os dois falam com o 3. Sem quórum,
+    os dois poderiam vender o mesmo assento ao mesmo tempo. Com quórum, o
+    nó 3 só aceita uma reserva: no máximo uma venda por assento."""
+    rede = criar_cluster(3, atraso=0.02)
+    rede.bloqueados |= {(1, 2), (2, 1)}
+    for assento in ASSENTOS[20:30]:
+        resultado = {}
+        barreira = threading.Barrier(2)
+
+        def tentar(i):
+            barreira.wait()
+            resultado[i] = rede.nos[i].comprar(assento, f"c{i}")[0]
+
+        ts = [threading.Thread(target=tentar, args=(i,)) for i in (1, 2)]
+        [t.start() for t in ts]
+        [t.join(15) for t in ts]
+        assert sum(resultado.values()) <= 1, (assento, resultado)
+        vencedores = [i for i, ok in resultado.items() if ok]
+        if vencedores:
+            dono = f"c{vencedores[0]}"
+            assert rede.nos[3].vendidos[assento][0] == dono
+            assert rede.nos[vencedores[0]].vendidos[assento][0] == dono
+
+
+def test_reserva_de_no_que_caiu_expira():
+    """Se quem reservou cai antes da fase 2, a reserva expira sozinha."""
+    rede = criar_cluster(3, reserva_expira=0.3)
+    for i in (2, 3):
+        rede.nos[i].ao_receber_reserva("D9", ("Fantasma", 1, 5), relogio=5)
+    ok, msg, _ = rede.nos[2].comprar("D9", "Bia")
+    assert not ok, "vendeu um assento reservado"
+    time.sleep(0.4)
+    ok, msg, _ = rede.nos[2].comprar("D9", "Bia")
+    assert ok, msg
+
+
+def test_persistencia_sobrevive_a_queda_de_todos():
+    """Todos os nós caem; um nó que volta sozinho lê as vendas do disco."""
+    import tempfile
+    pasta = tempfile.mkdtemp()
+    rede = criar_cluster(3, pasta_dados=pasta)
+    assert rede.nos[1].comprar("A9", "Duda")[0]
+    for i in (1, 2, 3):
+        desligar(rede, i)
+    novo = RedeMemoria()
+    novo.nos[2] = NoIngressos(2, [1, 2, 3], novo.visao(2), verbose=False,
+                              arquivo_dados=arquivo(pasta, 2))
+    novo.nos[2].iniciar()
+    novo.nos[2].parar()
+    assert novo.nos[2].vendidos["A9"][0] == "Duda"
+    assert novo.nos[2].vendas_abertas
+
+
+def test_sincronizacao_periodica_corrige_confirmacao_perdida():
+    """O nó 3 fica isolado durante uma venda e perde a confirmação. Quando a
+    rede volta, a sincronização periódica entrega a venda ao nó 3 sozinha,
+    sem ninguém pedir aquele assento de novo."""
+    rede = criar_cluster(3)
+    assert esperar(lambda: set(lideres(rede).values()) == {3})
+    rede.isolar(3)
+    assert esperar(lambda: rede.nos[2].eleicao.lider == 2)
+    assert rede.nos[1].comprar("B7", "Caio")[0]
+    assert "B7" not in rede.nos[3].vendidos
+    rede.bloqueados.clear()
+    assert esperar(lambda: rede.nos[3].vendidos.get("B7", ("",))[0] == "Caio", limite=8)
 
 
 if __name__ == "__main__":

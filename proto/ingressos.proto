@@ -31,8 +31,16 @@ service NoIngressos {
   // "Posso usar o assento X?" A resposta só volta quando o nó permite.
   rpc PedirAcesso (PedidoAcesso) returns (Permissao);
 
-  // ---------- Replicação dos dados ----------
-  rpc ReplicarVenda (Venda) returns (Confirmacao);
+  // ---------- Replicação com quórum (Entrega 2) ----------
+  // Fase 1: "reserve este assento para esta venda". Cada nó aceita no
+  // máximo UMA reserva por assento. A venda só segue com a MAIORIA.
+  rpc ReservarAssento (Venda) returns (RespostaReserva);
+  // Fase 2a: a maioria aceitou -> todos gravam a venda.
+  rpc ConfirmarVenda (Venda) returns (Confirmacao);
+  // Fase 2b: não houve maioria -> quem reservou desfaz a reserva.
+  rpc CancelarReserva (Venda) returns (Confirmacao);
+
+  // ---------- Outras mensagens de estado ----------
   rpc DefinirVendas (EstadoVendas) returns (Confirmacao);
   rpc ObterEstado (Vazio) returns (Estado);
 
@@ -75,6 +83,8 @@ message Status {
   bool vendas_abertas = 5;
   int32 vendidos = 6;
   int32 total_assentos = 7;
+  int32 quorum = 8;           // quantos nós formam a maioria (ex.: 2 de 3)
+  int32 total_nos = 9;
 }
 
 message Evento {
@@ -110,6 +120,16 @@ message Venda {
   int32 no_origem = 3;
   int64 relogio = 4;        // relógio da MENSAGEM (Lamport)
   int64 relogio_venda = 5;  // relógio do momento da VENDA (igual em todas as réplicas)
+}
+
+message RespostaReserva {
+  bool aceita = 1;
+  int64 relogio = 2;
+  // Se recusou: por quê ("vendido" ou "reservado") e quem ocupa o assento.
+  string motivo = 3;
+  string atual_comprador = 4;
+  int32 atual_no = 5;
+  int64 atual_relogio = 6;
 }
 
 message EstadoVendas {

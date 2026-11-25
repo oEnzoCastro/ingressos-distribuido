@@ -65,11 +65,24 @@ class RedeGrpc(Rede):
         return r.relogio, venda
 
     # ----- Replicação -----
-    def replicar_venda(self, destino, assento, comprador, no_origem, relogio_venda, relogio):
-        r = self._chamar(destino, "ReplicarVenda",
-                         pb.Venda(assento=assento, comprador=comprador, no_origem=no_origem,
-                                  relogio_venda=relogio_venda, relogio=relogio))
-        return r.relogio
+    @staticmethod
+    def _msg_venda(assento, venda, relogio):
+        comprador, no_origem, relogio_venda = venda
+        return pb.Venda(assento=assento, comprador=comprador, no_origem=no_origem,
+                        relogio_venda=relogio_venda, relogio=relogio)
+
+    def reservar_assento(self, destino, assento, venda, relogio):
+        r = self._chamar(destino, "ReservarAssento", self._msg_venda(assento, venda, relogio))
+        atual = (r.atual_comprador, r.atual_no, r.atual_relogio) if r.atual_comprador else None
+        return r.aceita, r.motivo, atual, r.relogio
+
+    def confirmar_venda(self, destino, assento, venda, relogio):
+        return self._chamar(destino, "ConfirmarVenda",
+                            self._msg_venda(assento, venda, relogio)).relogio
+
+    def cancelar_reserva(self, destino, assento, venda, relogio):
+        return self._chamar(destino, "CancelarReserva",
+                            self._msg_venda(assento, venda, relogio)).relogio
 
     def definir_vendas(self, destino, abertas, relogio):
         r = self._chamar(destino, "DefinirVendas",

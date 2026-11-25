@@ -52,18 +52,24 @@ class Cliente:
     # ------------------------------------------------------------------
     def status(self):
         print(f"  {'nó':<4}{'líder':<7}{'ativos':<14}{'Lamport':<9}{'vendas':<9}vendidos")
+        quorum, total, respondendo = 0, len(self.stubs), 0
         for n in range(1, len(self.stubs) + 1):
             try:
                 s = self.stub(n).ConsultarStatus(pb.Vazio(), timeout=2)
             except grpc.RpcError:
                 print(f"  {n:<4}FORA DO AR")
                 continue
+            respondendo += 1
+            quorum, total = s.quorum, s.total_nos
             lider = s.lider or "?"
             marca = " *" if s.lider == s.id else ""
             print(f"  {s.id:<4}{str(lider) + marca:<7}{str(list(s.ativos)):<14}{s.relogio:<9}"
                   f"{'abertas' if s.vendas_abertas else 'fechadas':<9}"
                   f"{s.vendidos}/{s.total_assentos}")
         print("  (* = este nó é o líder)")
+        if quorum:
+            situacao = "pode vender" if respondendo >= quorum else "SEM QUÓRUM: não vende"
+            print(f"  quórum: {quorum} de {total} nós; respondendo: {respondendo} -> {situacao}")
 
     def mapa(self, n="1"):
         r = self.chamar(n, "ConsultarMapa", pb.Vazio())

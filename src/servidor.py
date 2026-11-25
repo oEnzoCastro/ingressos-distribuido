@@ -11,7 +11,10 @@ Como executar um nó:
       --peers "1=localhost:50051,2=localhost:50052,3=localhost:50053"
 
 Também é possível usar variáveis de ambiente (usadas pelo Docker):
-  NO_ID, PORTA, PEERS, ATRASO_SECAO_CRITICA
+  NO_ID, PORTA, PEERS, ATRASO_SECAO_CRITICA, PASTA_DADOS
+
+As vendas confirmadas ficam em dados/no_<id>.json. Para começar do zero,
+apague a pasta "dados" com todos os nós desligados.
 """
 
 import argparse
@@ -62,9 +65,25 @@ class ServicoNo(pb_grpc.NoIngressosServicer):
                             vendido_no=no_origem, vendido_relogio=relogio_venda)
 
     # ---------- Replicação ----------
-    def ReplicarVenda(self, req, ctx):
-        rel = self.no.ao_receber_venda(req.assento, req.comprador, req.no_origem,
-                                       req.relogio_venda, req.relogio)
+    # ---------- Replicação com quórum ----------
+    @staticmethod
+    def _venda(req):
+        return (req.comprador, req.no_origem, req.relogio_venda)
+
+    def ReservarAssento(self, req, ctx):
+        aceita, motivo, atual, rel = self.no.ao_receber_reserva(
+            req.assento, self._venda(req), req.relogio)
+        resposta = pb.RespostaReserva(aceita=aceita, relogio=rel, motivo=motivo)
+        if atual:
+            resposta.atual_comprador, resposta.atual_no, resposta.atual_relogio = atual
+        return resposta
+
+    def ConfirmarVenda(self, req, ctx):
+        rel = self.no.ao_receber_confirmacao(req.assento, self._venda(req), req.relogio)
+        return pb.Confirmacao(relogio=rel)
+
+    def CancelarReserva(self, req, ctx):
+        rel = self.no.ao_receber_cancelamento(req.assento, self._venda(req), req.relogio)
         return pb.Confirmacao(relogio=rel)
 
     def DefinirVendas(self, req, ctx):
@@ -111,6 +130,8 @@ def main():
                    help='todos os nós, incluindo este: "1=host:porta,2=host:porta"')
     p.add_argument("--atraso", type=float, default=float(os.getenv("ATRASO_SECAO_CRITICA", "0")),
                    help="segundos dentro da seção crítica (para ver a espera na demo)")
+    p.add_argument("--dados", default=os.getenv("PASTA_DADOS", "dados"),
+                   help="pasta onde o nó grava as vendas (arquivo no_<id>.json)")
     args = p.parse_args()
 
     if not args.id or not args.peers:
@@ -120,7 +141,8 @@ def main():
     outros = {i: e for i, e in peers.items() if i != args.id}
 
     no = NoIngressos(args.id, list(peers.keys()), RedeGrpc(outros),
-                     atraso_secao_critica=args.atraso)
+                     atraso_secao_critica=args.atraso,
+                     arquivo_dados=os.path.join(args.dados, f"no_{args.id}.json"))
 
     # Muitos threads: PedirAcesso pode ficar esperando, e o servidor
     # precisa continuar atendendo outras chamadas enquanto isso.

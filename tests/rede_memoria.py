@@ -5,6 +5,7 @@ Ela chama os métodos dos outros nós diretamente, sem gRPC.
 Falhas que dá para simular:
   - nó desligado:        rede.desligados.add(3)
   - link de um só lado:  rede.bloqueados.add((2, 3))   # 2 não alcança 3, mas 3 alcança 2
+  - nó isolado:          rede.isolar(1)                # 1 não fala com ninguém
 """
 
 import os
@@ -25,6 +26,13 @@ class RedeMemoria:
         """A rede vista pelo nó 'origem'."""
         return _Visao(self, origem)
 
+    def isolar(self, no_id):
+        """Corta a comunicação do nó com todos os outros, nos dois sentidos."""
+        for outro in self.nos:
+            if outro != no_id:
+                self.bloqueados.add((no_id, outro))
+                self.bloqueados.add((outro, no_id))
+
 
 class _Visao(Rede):
     def __init__(self, rede, origem):
@@ -41,9 +49,14 @@ class _Visao(Rede):
     def pedir_acesso(self, destino, recurso, origem, relogio):
         return self._no(destino).mutex.ao_receber_pedido(recurso, origem, relogio)
 
-    def replicar_venda(self, destino, assento, comprador, no_origem, relogio_venda, relogio):
-        return self._no(destino).ao_receber_venda(assento, comprador, no_origem,
-                                                  relogio_venda, relogio)
+    def reservar_assento(self, destino, assento, venda, relogio):
+        return self._no(destino).ao_receber_reserva(assento, venda, relogio)
+
+    def confirmar_venda(self, destino, assento, venda, relogio):
+        return self._no(destino).ao_receber_confirmacao(assento, venda, relogio)
+
+    def cancelar_reserva(self, destino, assento, venda, relogio):
+        return self._no(destino).ao_receber_cancelamento(assento, venda, relogio)
 
     def definir_vendas(self, destino, abertas, relogio):
         return self._no(destino).ao_receber_definir_vendas(abertas, relogio)

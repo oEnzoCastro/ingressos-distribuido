@@ -31,9 +31,19 @@ class Rede:
         (para um assento: (comprador, no_origem, relogio_venda)) ou None."""
         raise NotImplementedError
 
-    # ----- Replicação -----
-    def replicar_venda(self, destino: int, assento: str, comprador: str,
-                       no_origem: int, relogio_venda: int, relogio: int) -> int:
+    # ----- Replicação com quórum -----
+    # venda = (comprador, no_origem, relogio_venda)
+    def reservar_assento(self, destino: int, assento: str, venda: tuple, relogio: int):
+        """Fase 1. Devolve (aceita, motivo, venda_atual, relogio).
+        Se recusou: motivo = "vendido" ou "reservado", venda_atual = quem ocupa."""
+        raise NotImplementedError
+
+    def confirmar_venda(self, destino: int, assento: str, venda: tuple, relogio: int) -> int:
+        """Fase 2a: a maioria aceitou; o destino grava a venda."""
+        raise NotImplementedError
+
+    def cancelar_reserva(self, destino: int, assento: str, venda: tuple, relogio: int) -> int:
+        """Fase 2b: sem maioria; o destino desfaz a reserva desta venda."""
         raise NotImplementedError
 
     def definir_vendas(self, destino: int, abertas: bool, relogio: int) -> int:
