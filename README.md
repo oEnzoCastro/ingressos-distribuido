@@ -20,8 +20,8 @@ compras simultâneas em nós diferentes, e **continua funcionando quando um nó 
 | O que | Onde está | O que resolve |
 |---|---|---|
 | **Controle de réplicas com quórum** | `src/no_ingressos.py` (`_vender_com_quorum`, `_reservar`) | A venda só é confirmada se a **maioria** dos nós (2 de 3) reservar o assento. Um nó isolado, ou o lado menor de uma rede dividida, não consegue vender. Duas maiorias sempre têm um nó em comum, e cada nó aceita só uma reserva por assento: não há venda dupla |
-| Reserva com prazo | `src/no_ingressos.py` (`reserva_expira`) | Se o nó que reservou cair antes de confirmar, a reserva expira em 10 s |
-| **Persistência em disco** | `src/persistencia.py` | Cada nó grava as vendas confirmadas em `dados/no_<id>.json` (escrita atômica). Se todos caírem, nada se perde |
+| Reserva com prazo | `src/no_ingressos.py` (`reserva_expira`, `_resolver_reserva_expirada`) | Uma reserva expira em 10 s; antes de liberar o assento, o nó pergunta ao vendedor se a venda foi confirmada. Vendedor fora do ar: o assento fica bloqueado, nunca revendido |
+| **Persistência em disco** | `src/persistencia.py` | Cada nó grava as vendas confirmadas e as reservas que aceitou em `dados/no_<id>.json` (escrita atômica). Se todos caírem, nada se perde, e um nó que reinicia não esquece em quem votou. Arquivo corrompido: o nó avisa e recupera dos outros |
 | **Sincronização periódica** (anti-entropia) | `src/no_ingressos.py` (`_sincronizar_com`) | A cada ~6 s, o líder junta as vendas dos nós ativos e cada nó copia do líder o que falta. Corrige confirmações perdidas |
 | Detecção de falha do líder e nova eleição | `src/no_ingressos.py`, `src/eleicao_bully.py` | Líder considerado morto após 2 heartbeats perdidos; o maior nó ativo assume |
 | Recuperação de um nó que volta | `src/no_ingressos.py` (`_carregar_do_disco`, `_sincronizar_estado`) | Lê o próprio arquivo e junta o mapa de todos os nós ativos |
@@ -131,7 +131,7 @@ Entrega 2 (quórum e persistência):
 python tests/test_algoritmos.py
 ```
 
-Os 18 testes conferem: Lamport, a corrida pelo mesmo assento, muitas compras
+Os 23 testes conferem: Lamport, a corrida pelo mesmo assento, muitas compras
 concorrentes sem venda dupla, réplicas iguais, eleição inicial, a falha e a
 volta do líder, a abertura de vendas pelo líder, a lista de nós ativos, a
 correção de dois líderes ao mesmo tempo, a réplica perdida que não pode
@@ -140,12 +140,19 @@ causar venda dupla e a regra de conflito pela ordem de Lamport.
 Entrega 2: nó isolado não vende; minoria sobrevivente não vende; partição
 assimétrica (nós 1 e 2 sem comunicação, ambos falando com o 3) sem venda
 dupla; reserva de um nó que caiu expira; persistência após a queda de todos
-os nós; sincronização periódica corrige uma confirmação perdida.
+os nós; sincronização periódica corrige uma confirmação perdida; confirmação
+perdida com o vendedor caído não leva a revenda; reserva sobrevive ao reinício
+do nó; tentativa antiga do mesmo vendedor não bloqueia; arquivo corrompido
+não impede o nó de subir.
 
 ## Limitações conhecidas
 
 - Com 3 nós, o sistema tolera a falha de 1 nó. Com 2 nós fora, ele para de
   vender (por segurança): é a troca entre disponibilidade e consistência.
+- Se o vendedor cai depois de reunir a maioria e antes de a confirmação chegar
+  aos outros nós, o assento fica **bloqueado em dúvida** até o vendedor voltar:
+  os outros nós não sabem se a venda foi confirmada, então não revendem.
+  É o mesmo bloqueio conhecido do 2PC.
 - A lista de nós é fixa (`--peers`): incluir um nó novo exige reiniciar os outros.
 - Cada compra troca 6 × (N − 1) mensagens (pedido e resposta de permissão,
   de reserva e de confirmação): com muitos nós, as compras ficam mais lentas.

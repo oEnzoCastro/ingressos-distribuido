@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from rede_memoria import RedeMemoria          # noqa: E402
 from no_ingressos import NoIngressos, ASSENTOS  # noqa: E402
 from relogio_lamport import RelogioLamport   # noqa: E402
+from rede import NoIndisponivel             # noqa: E402
 
 
 def arquivo(pasta, no_id):
@@ -313,6 +314,83 @@ def test_sincronizacao_periodica_corrige_confirmacao_perdida():
     assert "B7" not in rede.nos[3].vendidos
     rede.bloqueados.clear()
     assert esperar(lambda: rede.nos[3].vendidos.get("B7", ("",))[0] == "Caio", limite=8)
+
+
+
+# ----------------------------------------------------------------------
+# Casos de erro encontrados na revisão da Entrega 2
+# ----------------------------------------------------------------------
+def test_confirmacao_perdida_e_vendedor_caido_nao_revende():
+    """A confirmação não chega a ninguém e o vendedor cai. As reservas expiram,
+    mas o assento NÃO pode ser vendido de novo: fica bloqueado em dúvida."""
+    rede = criar_cluster(3, reserva_expira=0.3)
+    assert esperar(lambda: set(lideres(rede).values()) == {3})
+
+    def falha(*_):
+        raise NoIndisponivel(0)
+    rede.nos[1].rede.confirmar_venda = falha
+    assert rede.nos[1].comprar("A1", "Maria")[0]
+    desligar(rede, 1)
+    time.sleep(0.5)
+    ok, msg, _ = rede.nos[2].comprar("A1", "João")
+    assert not ok, "venda dupla: " + msg
+
+
+def test_reserva_em_duvida_resolvida_quando_vendedor_volta():
+    """Mesmo caso; quando o vendedor responde, os outros nós adotam a venda."""
+    rede = criar_cluster(3, reserva_expira=0.3)
+    assert esperar(lambda: set(lideres(rede).values()) == {3})
+    original = rede.nos[1].rede.confirmar_venda
+
+    def falha(*_):
+        raise NoIndisponivel(0)
+    rede.nos[1].rede.confirmar_venda = falha
+    assert rede.nos[1].comprar("A2", "Maria")[0]
+    rede.nos[1].rede.confirmar_venda = original
+    time.sleep(0.4)
+    ok, msg, _ = rede.nos[2].comprar("A2", "João")
+    assert not ok and "Maria" in msg, msg
+    assert rede.nos[2].vendidos["A2"][0] == "Maria"
+
+
+def test_reserva_sobrevive_a_reinicio_do_no():
+    """O nó 3 vota na Maria e reinicia antes da confirmação. Ele não pode
+    esquecer o voto e votar no João (o voto fica gravado em disco)."""
+    import tempfile
+    pasta = tempfile.mkdtemp()
+    rede = criar_cluster(3, pasta_dados=pasta)
+    assert esperar(lambda: set(lideres(rede).values()) == {3})
+    rede.bloqueados |= {(1, 2), (2, 1)}
+    assert rede.nos[3].ao_receber_reserva("B2", ("Maria", 1, 999), 1)[0]
+    desligar(rede, 3)
+    rede.desligados.discard(3)
+    rede.nos[3] = NoIngressos(3, [1, 2, 3], rede.visao(3), intervalo_heartbeat=0.2,
+                              limite_inativo=1.0, espera_coordenador=0.5, verbose=False,
+                              arquivo_dados=arquivo(pasta, 3))
+    rede.nos[3].iniciar()
+    ok, msg, _ = rede.nos[2].comprar("B2", "João")
+    assert not ok, "o nó reiniciado votou duas vezes: " + msg
+
+
+def test_tentativa_antiga_do_mesmo_vendedor_nao_bloqueia():
+    rede = criar_cluster(3)
+    for i in (2, 3):
+        rede.nos[i].ao_receber_reserva("C3", ("Bia", 1, 5), 5)
+    ok, msg, _ = rede.nos[1].comprar("C3", "Bia")
+    assert ok, msg
+
+
+def test_arquivo_corrompido_nao_impede_o_no_de_subir():
+    import tempfile
+    pasta = tempfile.mkdtemp()
+    with open(arquivo(pasta, 1), "w") as f:
+        f.write("{corrompido")
+    rede = RedeMemoria()
+    rede.nos[1] = NoIngressos(1, [1, 2, 3], rede.visao(1), verbose=False,
+                              arquivo_dados=arquivo(pasta, 1))
+    rede.nos[1].iniciar()
+    rede.nos[1].parar()
+    assert rede.nos[1].vendidos == {}
 
 
 if __name__ == "__main__":

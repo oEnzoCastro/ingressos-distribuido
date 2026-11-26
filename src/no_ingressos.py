@@ -40,7 +40,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from eleicao_bully import EleicaoBully
 from exclusao_mutua import ExclusaoMutua
-from persistencia import Persistencia
+from persistencia import ArquivoCorrompido, Persistencia
 from rede import NoIndisponivel, TempoEsgotado
 from relogio_lamport import RelogioLamport
 
@@ -124,16 +124,24 @@ class NoIngressos:
         self._rodando = False
 
     def _carregar_do_disco(self):
-        """Lê as vendas confirmadas gravadas antes de o nó cair."""
-        vendidos, abertas = self.persistencia.carregar()
-        if not vendidos and not abertas:
+        """Lê as vendas confirmadas e as reservas gravadas antes de o nó cair."""
+        try:
+            vendidos, abertas, reservas = self.persistencia.carregar()
+        except ArquivoCorrompido as erro:
+            # Não impede o nó de subir: ele recupera o estado dos outros nós.
+            self.log(f"arquivo de dados inválido, ignorado: {erro}")
+            return
+        if not vendidos and not abertas and not reservas:
             return
         with self._lock_dados:
             self.vendidos.update(vendidos)
             self.vendas_abertas = abertas
+            self.reservas.update(reservas)
         # O relógio volta a partir da maior venda gravada.
-        self.relogio.atualizar(max((v[2] for v in vendidos.values()), default=0))
-        self.log(f"estado lido do disco: {len(vendidos)} assentos vendidos")
+        maior = [v[2] for v in vendidos.values()] + [r[0][2] for r in reservas.values()]
+        self.relogio.atualizar(max(maior, default=0))
+        self.log(f"estado lido do disco: {len(vendidos)} assentos vendidos, "
+                 f"{len(reservas)} reserva(s)")
 
     def _sincronizar_estado(self):
         """Ao iniciar, junta o mapa de assentos de TODOS os nós ativos.
@@ -315,6 +323,7 @@ class NoIngressos:
             except (NoIndisponivel, TempoEsgotado):
                 return destino, None, None, None
 
+        inicio = time.time()
         for destino, ok, mot, atu in self._pool.map(reservar_em, self.ids_outros):
             if ok:
                 aceitaram.append(destino)
@@ -322,9 +331,14 @@ class NoIngressos:
                 sem_resposta.append(destino)
             else:
                 recusas.append((destino, mot, atu))
+        lento = time.time() - inicio > self.reserva_expira / 2
+        if lento:
+            # Os votos demoraram demais: as reservas podem estar perto de
+            # expirar nos outros nós. Por segurança, não confirma.
+            self.log(f"reservas de {assento} demoraram demais; a venda não será confirmada")
 
         # Fase 2a: maioria -> confirma em todos.
-        if len(aceitaram) >= self.maioria:
+        if len(aceitaram) >= self.maioria and not lento:
             self.log(f"quórum atingido para {assento}: nós {sorted(aceitaram)} aceitaram "
                      f"({len(aceitaram)} de {len(self.todos_ids)}, mínimo {self.maioria})")
             with self._lock_dados:
@@ -372,7 +386,7 @@ class NoIngressos:
         return (False, f"Assento {assento} está em disputa com outra compra (tente de novo)",
                 self.relogio.valor)
 
-    def _reservar(self, assento, venda):
+    def _reservar(self, assento, venda, tentar_resolver=True):
         """Regra de cada nó na fase 1: aceita no máximo UMA reserva por assento.
         Devolve (aceita, motivo, venda_atual)."""
         with self._lock_dados:
@@ -381,20 +395,63 @@ class NoIngressos:
                 atual = self.vendidos[assento]
                 return (True, "", None) if atual == venda else (False, "vendido", atual)
             reserva = self.reservas.get(assento)
-            if reserva and reserva[0] != venda and reserva[1] > agora:
-                return False, "reservado", reserva[0]
-            self.reservas[assento] = (venda, agora + self.reserva_expira)
-            return True, "", None
+            outra = reserva and reserva[0] != venda
+            # Uma tentativa nova do MESMO vendedor substitui a antiga: ele só
+            # faz uma tentativa por assento de cada vez (seção crítica).
+            mesmo_vendedor = outra and reserva[0][1] == venda[1]
+            if outra and not mesmo_vendedor:
+                if reserva[1] > agora:
+                    return False, "reservado", reserva[0]
+                expirada = reserva[0]
+            else:
+                self.reservas[assento] = (venda, agora + self.reserva_expira)
+                self._gravar_disco()
+                return True, "", None
+        # A reserva de outra venda expirou. Isso NÃO libera o assento sozinho:
+        # o vendedor pode ter confirmado e a confirmação se perdido.
+        if tentar_resolver and self._resolver_reserva_expirada(assento, expirada):
+            return self._reservar(assento, venda, tentar_resolver=False)
+        return False, "reservado", expirada
+
+    def _resolver_reserva_expirada(self, assento, antiga):
+        """Pergunta ao vendedor da reserva antiga se ele confirmou a venda.
+        Confirmou: adota a venda. Não confirmou: libera o assento.
+        Vendedor fora do ar: o assento continua bloqueado (em dúvida),
+        porque é melhor travar do que vender duas vezes.
+        Devolve True se a dúvida foi resolvida."""
+        vendedor = antiga[1]
+        if vendedor == self.meu_id:
+            vendidos_dele = None          # tentativa minha que terminou sem limpar
+        else:
+            try:
+                vendidos_dele, _, rel = self.rede.obter_estado(vendedor)
+                self.relogio.atualizar(rel)
+            except (NoIndisponivel, TempoEsgotado):
+                self.log(f"reserva de {assento} em dúvida: o nó {vendedor} não responde; "
+                         f"o assento fica bloqueado")
+                return False
+        with self._lock_dados:
+            if self.reservas.get(assento, (None,))[0] != antiga:
+                return True               # mudou enquanto eu perguntava
+            del self.reservas[assento]
+            venda = (vendidos_dele or {}).get(assento)
+            if venda:
+                self._mesclar_venda(assento, venda, "consulta ao vendedor")
+            self._gravar_disco()
+        self.log(f"reserva expirada de {assento} resolvida com o nó {vendedor}: "
+                 f"{'vendido para ' + venda[0] if venda else 'assento livre'}")
+        return True
 
     def _cancelar_local(self, assento, venda):
         with self._lock_dados:
             if self.reservas.get(assento, (None,))[0] == venda:
                 del self.reservas[assento]
+                self._gravar_disco()
 
     def _gravar_disco(self):
         """Chamar com self._lock_dados já adquirido."""
         try:
-            self.persistencia.salvar(self.vendidos, self.vendas_abertas)
+            self.persistencia.salvar(self.vendidos, self.vendas_abertas, self.reservas)
         except OSError as erro:
             self.log(f"erro ao gravar no disco: {erro!r}")
 
@@ -493,6 +550,7 @@ class NoIngressos:
         atual = self.vendidos.get(assento)
         if atual == venda:
             return
+        self.reservas.pop(assento, None)   # assento vendido: a reserva não vale mais
         if atual is None:
             self.vendidos[assento] = venda
             if origem != "réplica":
